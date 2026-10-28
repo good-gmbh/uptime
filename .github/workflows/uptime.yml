@@ -1,0 +1,47 @@
+# Verfügbarkeitsprüfung von außen für GOOD Workspace.
+# Läuft im öffentlichen Repository good-gmbh/uptime (öffentlich = unbegrenzte Actions-Minuten).
+# Enthält keine Geheimnisse und keine Fremd-Actions; ruft nur öffentliche Adressen ab.
+# Bei einem Fehler schickt GitHub eine Mail an die Person, die den Zeitplan zuletzt geändert hat.
+# Quelle: GOOD Workspace, deploy/uptime/uptime.yml
+name: Verfügbarkeit
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  # Nur um den eigenen Zeitplan aktiv zu halten (GitHub pausiert ihn sonst nach 60 Tagen ohne Commit).
+  actions: write
+
+jobs:
+  workspace:
+    name: workspace.good.gmbh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      HOST: workspace.good.gmbh
+    steps:
+      - name: Erreichbarkeit und Datenbank (/api/health)
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o body -m 15 -w '%{http_code}' "https://$HOST/api/health") || code=000
+            if [ "$code" = 200 ] && grep -q '"ok"' body; then echo "OK (Versuch $i)"; exit 0; fi
+            echo "Versuch $i: HTTP $code"; sleep 20
+          done
+          echo "::error::$HOST nicht erreichbar oder Datenbank gestört (HTTP $code)"
+          exit 1
+
+      - name: Zertifikat (mindestens 20 Tage gültig)
+        run: |
+          end=$(echo | openssl s_client -connect "$HOST:443" -servername "$HOST" 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+          days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+          echo "Zertifikat gültig bis $end ($days Tage)"
+          # Caddy verlängert 30 Tage vor Ablauf; unter 20 Tagen klemmt die Verlängerung.
+          [ "$days" -ge 20 ] || { echo "::error::Zertifikat läuft in $days Tagen ab"; exit 1; }
+
+      - name: Zeitplan aktiv halten
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime.yml/enable" --silent
